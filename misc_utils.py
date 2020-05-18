@@ -12,6 +12,7 @@ import inspect
 # get_debug_loc - get filename and line number of stack frame call
 # debug_print - print with prefix being filename and line number
 # shape_assert - assert shape of tensor is equal to given list with -1 meaning don't care
+# specify_gpu -- specify which gpu index to use, -1 means use given criterion
 
 def load_dataset(dataset_name, data_dir, train=True):
     transforms = tv.transforms.ToTensor()
@@ -89,8 +90,9 @@ def get_debug_loc(level=1):
     return filename, line_number
 
 def debug_print(*args, **kwargs):
+    import sys
     filename, line_number = get_debug_loc(2)
-    print("(%s, %d) >> " % (filename, line_number), *args, **kwargs)
+    print("(%s, %d) >> " % (filename, line_number), *args, file=sys.stderr, **kwargs)
 
 def shape_assert(s, t, prefix=""):
     if isinstance(s, torch.Tensor):
@@ -105,6 +107,11 @@ def shape_assert(s, t, prefix=""):
         if t[i] == -1:
             continue
         assert s[i] == t[i], "(%s, %d) >> %s: %s[%d] == %s[%d]" % (filename, line_number, prefix, s, i, t, i)
+
+def specify_gpu(gpu_index, criterion='mem'):
+    from gpu_utils.utils import gpu_init
+    if gpu_index == -1:
+        gpu_id = gpu_init(best_gpu_metric=criterion, ml_library='torch')
 
 def equal_length(*l):
     n = None
@@ -184,6 +191,7 @@ class Parsing:
 
     @staticmethod
     def parse_args(parser):
+        import copy
         args = parser.parse_args()
         if not hasattr(args, 'config_file'):
             return args
@@ -193,7 +201,23 @@ class Parsing:
         if len(args.config_file) > 0:
             for filename in args.config_file:
                 with open(filename, 'r') as f:
-                    args2, leftovers = parser.parse_known_args(f.read().split())
+                    arg_value_list = []
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('#') or line == '':
+                            continue
+                        elif line.startswith('--'):
+                            line = line.split(maxsplit=1)
+                            if len(line) == 1:
+                                arg_value_list += [line[0], '']
+                            else:
+                                arg_value_list += [line[0], line[1]]
+                        else:
+                            arg_value_list[-1] = arg_value_list[-1] + line
+                    assert len(arg_value_list) % 2 == 0, arg_value_list
+                    debug_print(arg_value_list)
+
+                    args2, leftovers = parser.parse_known_args(arg_value_list)
                     for k, v in vars(args2).items():
                         if v is None:
                             continue
@@ -302,8 +326,13 @@ def recursive_split(s, delim=','):
 #
 #   , for options for layer
 #   | for parallel layers
-#   conv:num_filters,kernel_size,stride
+
+#   input:num_inputs
+#   conv1d:num_filters,kernel_size,stride
+#   conv2d:num_filters,kernel_size,stride
 #   fc:num_outputs
+#   resnet:num_outputs
+#   reshape:new_shape
 
 class NetworkSpec:
     @staticmethod
@@ -391,6 +420,8 @@ class NetworkSpec:
                     net = nn.LeakyReLU(negative_slope=leak)
                 elif kind == 'tanh':
                     net = nn.Tanh()
+                elif kind == 'sigmoid':
+                    net = nn.Sigmoid()
                 elif kind == 'fc':
                     n_outs = int(layer_args.pop(0))
                     net = nn.Linear(np.prod(input_shape[layer_i]), n_outs, **sn_kwargs)
@@ -493,6 +524,12 @@ class NetworkSpec:
                 elif kind == 'flatten':
                     input_shape[layer_i] = [np.prod(input_shape[layer_i])]
                     net = Lambda(lambda x, y : x.view([-1, y]), input_shape[layer_i][0])
+                elif kind == 'mul':
+                    factor = float(layer_args.pop(0))
+                    net = Lambda(lambda x : x * factor)
+                elif kind == 'add':
+                    amt = float(layer_args.pop(0))
+                    net = Lambda(lambda x : x + amt)
                 elif kind == 'scale_pm1_to_01':
                     net = Lambda(lambda x : x / 2 + 0.5)
                 elif kind == 'scale_01_to_pm1':
@@ -563,6 +600,7 @@ class NetworkSpec:
         input_shape,
         batch_size,
         do_batch_norm=True,
+        verbose=False,
         **sn_kwargs
     ):
         import torch
@@ -592,7 +630,8 @@ class NetworkSpec:
                 x = x.permute(permutation)
                 return x
 
-        print('input_shape', input_shape)
+        if verbose:
+            print('input_shape', input_shape)
         for i, parallel_layers in enumerate(spec):
             assert len(parallel_layers) == 1
             parts = parallel_layers[0]
@@ -623,6 +662,8 @@ class NetworkSpec:
                 net = nn.LeakyReLU(negative_slope=leak)
             elif kind == 'tanh':
                 net = nn.Tanh()
+            elif kind == 'sigmoid':
+                net = nn.Sigmoid()
             elif kind == 'fc':
                 n_outs = int(layer_args.pop(0))
                 net = nn.Linear(np.prod(input_shape), n_outs, **sn_kwargs)
@@ -705,7 +746,7 @@ class NetworkSpec:
                 new_shape = [int(k) for k in layer_args] # new shape
                 layer_args = []
                 if -1 not in new_shape:
-                    assert np.prod(new_shape) == np.prod(input_shape)
+                    assert np.prod(new_shape) == np.prod(input_shape), '%s, %s' % (new_shape, input_shape)
                 else:
                     assert new_shape.count(-1) == 1
                     assert -np.prod(new_shape) <= np.prod(input_shape)
@@ -715,6 +756,12 @@ class NetworkSpec:
             elif kind == 'flatten':
                 input_shape = [np.prod(input_shape)]
                 net = Lambda(lambda x, y : x.view([-1, batch_size, y]), input_shape[0])
+            elif kind == 'mul':
+                factor = float(layer_args.pop(0))
+                net = Lambda(lambda x : x * factor)
+            elif kind == 'add':
+                amt = float(layer_args.pop(0))
+                net = Lambda(lambda x : x + amt)
             elif kind == 'scale_pm1_to_01':
                 net = Lambda(lambda x : x / 2 + 0.5)
             elif kind == 'scale_01_to_pm1':
@@ -724,7 +771,8 @@ class NetworkSpec:
             else:
                 raise ValueError("unknown op '{}'".format(kind))
             layers += [net]
-            print(input_shape)
+            if verbose:
+                print(input_shape)
         assert type(input_shape) is list
 
         class Model(nn.Module):
@@ -741,5 +789,6 @@ class NetworkSpec:
                 return x
 
         model = Model()
-        print('Num model params', sum((p.numel() for p in model.parameters())))
+        if verbose:
+            print('Num model params', sum((p.numel() for p in model.parameters())))
         return model, input_shape
