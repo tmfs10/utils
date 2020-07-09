@@ -375,7 +375,9 @@ class NetworkSpec:
         print('input_shape', input_shape)
         for i, parallel_layers in enumerate(spec):
             next_layers = []
+			merge = False
             if len(parallel_layers) < len(input_shape):
+				merge = True
                 assert len(parallel_layers) == 1, len(parallel_layers)
             else:
                 assert len(parallel_layers) == len(input_shape), "len(%s) == len(%s)" % (parallel_layers, input_shape)
@@ -509,6 +511,8 @@ class NetworkSpec:
 
                     input_shape[layer_i] = [n_filts, H_out, W_out]
                 elif kind == 'transformer':
+					assert len(input_shape[layer_i]) == 2 # seq_len, input_size
+					assert merge
                     ninput_features = int(layer_args.pop(0))
                     nheads = 8 if not layer_args else int(layer_args.pop(0)) 
                     num_encoder_layers = 6 if not layer_args else int(layer_args.pop(0))
@@ -516,7 +520,8 @@ class NetworkSpec:
                     dim_feedforward = 2048 if not layer_args else int(layer_args.pop(0))
                     dropout = 0.1 if not layer_args else float(layer_args.pop(0))
                     activation = 'relu' if not layer_args else layer_args.pop(0)
-                    net = nn.Transformer(
+                    net = nn.Sequential([
+						nn.Transformer(
                             ninput_features,
                             nheads,
                             num_encoder_layers,
@@ -524,9 +529,19 @@ class NetworkSpec:
                             dim_feedforward,
                             dropout,
                             activation,
-                            )
+                            ),
+						Lambda(lambda x : x.permute([1, 0, 2]))
+						])
 
-                    input_shape[layer_i] = []
+					assert len(parallel_layers) < len(input_shape)
+					assert len(input_shape) == 2
+					assert input_shape[0][1] == input_shape[1][1]
+
+					target_seq_len = input_shape[1][0]
+					num_words = input_shape[1][1]
+
+					# output is (T, N, E) -> (N, T, E)
+					input_shape = [ [target_seq_len, num_words] ]
                 elif kind == 'bn1d':
                     assert len(input_shape[layer_i]) <= 2
                     if do_batch_norm:
@@ -580,7 +595,7 @@ class NetworkSpec:
                 assert not layer_args, kind
                 if single_module:
                     return net
-                next_layers += [net]
+                next_layers += [net] # adding individual parallel layers
             layers += [next_layers]
             print(parallel_layers, input_shape)
         assert type(input_shape) is list
@@ -600,12 +615,23 @@ class NetworkSpec:
 
                 for i, l in enumerate(layers):
                     next_x = []
+					merge = False
+					if i > 0 and len(layers[i]) < len(layers[i-1]):
+						assert len(layers[i]) == 1
+						merge = True
                     for j, p in enumerate(l):
-                        if isinstance(l, nn.LSTM):
-                            out, _ = p(x[j])
-                            next_x += [out]
-                        else:
-                            next_x += [p(x[j])]
+						if merge:
+							if isinstance(l, nn.LSTM):
+								out, _ = p(*x)
+								next_x += [out]
+							else:
+								next_x += [p(*x)]
+						else:
+                            if isinstance(l, nn.LSTM):
+                                out, _ = p(x[j])
+                                next_x += [out]
+                            else:
+                                next_x += [p(x[j])]
                     x = next_x
                 assert type(x) is list and len(x) == 1
                 return x[0]
