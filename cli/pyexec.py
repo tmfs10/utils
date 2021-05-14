@@ -241,6 +241,7 @@ for ___index in range(len(___inner_expr_list)):
 				F += [None]
 			else:
 				F += [[___k.strip() for ___k in line.strip().split("\t")]]
+        FF=F[0]
 		try:
 			exec(___inner_expr)
 		except BreakException as ____e:
