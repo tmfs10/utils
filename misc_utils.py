@@ -385,6 +385,7 @@ def recursive_split(s, delim=','):
 #   fc:num_outputs
 #   resnet:num_outputs
 #   reshape:new_shape
+#   transformer:input_features,nheads,num_encoder_layers,num_decoder_layers,dim_feedforward,dropout,activation
 
 class NetworkSpec:
     @staticmethod
@@ -426,7 +427,9 @@ class NetworkSpec:
         print('input_shape', input_shape)
         for i, parallel_layers in enumerate(spec):
             next_layers = []
+			merge = False
             if len(parallel_layers) < len(input_shape):
+				merge = True
                 assert len(parallel_layers) == 1, len(parallel_layers)
             else:
                 assert len(parallel_layers) == len(input_shape), "len(%s) == len(%s)" % (parallel_layers, input_shape)
@@ -559,6 +562,38 @@ class NetworkSpec:
                                 **sn_kwargs)
 
                     input_shape[layer_i] = [n_filts, H_out, W_out]
+                elif kind == 'transformer':
+					assert len(input_shape[layer_i]) == 2 # seq_len, input_size
+					assert merge
+                    ninput_features = int(layer_args.pop(0))
+                    nheads = 8 if not layer_args else int(layer_args.pop(0)) 
+                    num_encoder_layers = 6 if not layer_args else int(layer_args.pop(0))
+                    num_decoder_layers = 6 if not layer_args else int(layer_args.pop(0))
+                    dim_feedforward = 2048 if not layer_args else int(layer_args.pop(0))
+                    dropout = 0.1 if not layer_args else float(layer_args.pop(0))
+                    activation = 'relu' if not layer_args else layer_args.pop(0)
+                    net = nn.Sequential([
+						nn.Transformer(
+                            ninput_features,
+                            nheads,
+                            num_encoder_layers,
+                            num_decoder_layers,
+                            dim_feedforward,
+                            dropout,
+                            activation,
+                            ),
+						Lambda(lambda x : x.permute([1, 0, 2]))
+						])
+
+					assert len(parallel_layers) < len(input_shape)
+					assert len(input_shape) == 2
+					assert input_shape[0][1] == input_shape[1][1]
+
+					target_seq_len = input_shape[1][0]
+					num_words = input_shape[1][1]
+
+					# output is (T, N, E) -> (N, T, E)
+					input_shape = [ [target_seq_len, num_words] ]
                 elif kind == 'bn1d':
                     assert len(input_shape[layer_i]) <= 2
                     if do_batch_norm:
@@ -612,7 +647,7 @@ class NetworkSpec:
                 assert not layer_args, kind
                 if single_module:
                     return net
-                next_layers += [net]
+                next_layers += [net] # adding individual parallel layers
             layers += [next_layers]
             print(parallel_layers, input_shape)
         assert type(input_shape) is list
@@ -632,12 +667,23 @@ class NetworkSpec:
 
                 for i, l in enumerate(layers):
                     next_x = []
+					merge = False
+					if i > 0 and len(layers[i]) < len(layers[i-1]):
+						assert len(layers[i]) == 1
+						merge = True
                     for j, p in enumerate(l):
-                        if isinstance(l, nn.LSTM):
-                            out, _ = p(x[j])
-                            next_x += [out]
-                        else:
-                            next_x += [p(x[j])]
+						if merge:
+							if isinstance(l, nn.LSTM):
+								out, _ = p(*x)
+								next_x += [out]
+							else:
+								next_x += [p(*x)]
+						else:
+                            if isinstance(l, nn.LSTM):
+                                out, _ = p(x[j])
+                                next_x += [out]
+                            else:
+                                next_x += [p(x[j])]
                     x = next_x
                 assert type(x) is list and len(x) == 1
                 return x[0]
@@ -646,201 +692,3 @@ class NetworkSpec:
         print('Num model params', sum((p.numel() for p in model.parameters())))
         return model, input_shape[0]
 
-    @staticmethod
-    def make_parallel(
-        spec,
-        input_shape,
-        batch_size,
-        do_batch_norm=True,
-        verbose=False,
-        **sn_kwargs
-    ):
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        from torchvision.models.resnet import ResNet, BasicBlock
-
-        assert type(input_shape) == list
-        if type(input_shape[0]) != list:
-            input_shape = [input_shape]
-        
-        params = []
-        layers = []
-
-        class Lambda(nn.Module):
-            def __init__(self, fn, *args):
-                super(Lambda, self).__init__()
-                self.fn = fn
-                self.args = args
-            def forward(self, x):
-                return self.fn(x, *self.args)
-
-        def batch_norm_fun(permutation):
-            def fun(x, batch_norm_layer):
-                x = x.permute(permutation)
-                x = batch_norm_layer(x)
-                x = x.permute(permutation)
-                return x
-
-        if verbose:
-            print('input_shape', input_shape)
-        for i, parallel_layers in enumerate(spec):
-            assert len(parallel_layers) == 1
-            parts = parallel_layers[0]
-
-            kind = parts[0]
-            layer_args = parts[1:]
-
-            if kind == 'input':
-                assert len(layer_args) > 0
-                n_ins = int(layer_args.pop(0))
-                inp = (torch.rand(1, batch_size, n_ins)-0.5)*2
-                inp = nn.Parameter(inp)
-                params += [inp]
-                net = Lambda((lambda x, y : y), inp)
-                input_shape = [n_ins]
-            elif kind == 'avgpool1d':
-                kernel_size = int(layer_args.pop(0))
-                stride = int(layer_args.pop(0))
-                net = nn.AvgPool2d(kernel_size=(1, kernel_size), stride=(1, stride))
-            elif kind == 'avgpool2d':
-                kernel_size = int(layer_args.pop(0))
-                stride = int(layer_args.pop(0))
-                net = nn.AvgPool3d(kernel_size=(1, kernel_size, kernel_size), stride=(1, stride, stride))
-            elif kind == 'relu':
-                net = nn.ReLU()
-            elif kind == 'lrelu':
-                leak = 0.2 if not layer_args else float(layer_args.pop(0))
-                net = nn.LeakyReLU(negative_slope=leak)
-            elif kind == 'tanh':
-                net = nn.Tanh()
-            elif kind == 'sigmoid':
-                net = nn.Sigmoid()
-            elif kind == 'fc':
-                n_outs = int(layer_args.pop(0))
-                net = nn.Linear(np.prod(input_shape), n_outs, **sn_kwargs)
-                input_shape = [n_outs]
-            elif kind == 'conv1d':
-                n_filts = int(layer_args.pop(0)) # out_channels
-                kernel_size = 5 if not layer_args else int(layer_args.pop(0))
-                stride = 2 if not layer_args else int(layer_args.pop(0))
-                if len(input_shape) != 2:
-                    raise ValueError("need to reshape_2d before conv. Current shape is %s" % (input_shape))
-                in_channels = input_shape[0]
-                padding = 0
-                dilation = 1
-
-                L_out = nnShapes.conv1d(input_shape, padding, dilation, kernel_size, stride)
-                net = nn.Conv2d(
-                        in_channels,
-                        n_filts,
-                        kernel_size=(1, kernel_size),
-                        stride=(1, stride),
-                        padding=padding,
-                        dilation=dilation,
-                        **sn_kwargs)
-                input_shape = [n_filts, L_out]
-            elif kind in ('deconv2d', 'conv2d'):
-                n_filts = int(layer_args.pop(0)) # out_channels
-                kernel_size = 5 if not layer_args else int(layer_args.pop(0))
-                stride = 2 if not layer_args else int(layer_args.pop(0))
-                if len(input_shape) != 3:
-                    raise ValueError("need to reshape_3d before conv. Current shape is %s" % (input_shape))
-                in_channels = input_shape[0]
-                padding = 0
-                dilation = 1
-
-                if kind == 'conv2d':
-                    H_out, W_out = nnShapes.conv2d(input_shape, padding, dilation, kernel_size, stride)
-                    net = nn.Conv3d(
-                            in_channels,
-                            n_filts,
-                            kernel_size=(1, kernel_size, kernel_size),
-                            stride=(1, stride, stride),
-                            padding=padding,
-                            dilation=dilation,
-                            **sn_kwargs)
-                else:
-                    output_padding = 0
-                    H_out, W_out = nnShapes.deconv2d(input_shape, padding, output_padding, dilation, kernel_size, stride)
-                    net = nn.ConvTranspose3d(
-                            in_channels,
-                            n_filts,
-                            kernel_size=(1, kernel_size, kernel_size),
-                            stride=(1, stride, stride),
-                            padding=padding,
-                            output_padding=output_padding,
-                            dilation=dilation,
-                            **sn_kwargs)
-
-                input_shape = [n_filts, H_out, W_out]
-            elif kind == 'bn1d':
-                if do_batch_norm:
-                    if len(input_shape) == 1:
-                        net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm1d(input_shape[0]))
-                    else:
-                        assert len(input_shape) == 2
-                        net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm2d(input_shape[0]))
-            elif kind == 'bn1d*':
-                if len(input_shape) == 1:
-                    net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm1d(input_shape[0]))
-                else:
-                    assert len(input_shape) == 2
-                    net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm2d(input_shape[0]))
-            elif kind == 'bn2d':
-                assert len(input_shape) == 3
-                if do_batch_norm:
-                    net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm3d(input_shape[0]))
-            elif kind == 'bn2d*':
-                assert len(input_shape) == 3
-                net = Lambda(batch_norm_fun([2, 1]), nn.BatchNorm3d(input_shape[0]))
-            elif kind == 'reshape':
-                new_shape = [int(k) for k in layer_args] # new shape
-                layer_args = []
-                if -1 not in new_shape:
-                    assert np.prod(new_shape) == np.prod(input_shape), '%s, %s' % (new_shape, input_shape)
-                else:
-                    assert new_shape.count(-1) == 1
-                    assert -np.prod(new_shape) <= np.prod(input_shape)
-                input_shape = new_shape
-                new_shape = [1, batch_size] + new_shape
-                net = Lambda(lambda x : x.view(new_shape))
-            elif kind == 'flatten':
-                input_shape = [np.prod(input_shape)]
-                net = Lambda(lambda x, y : x.view([-1, batch_size, y]), input_shape[0])
-            elif kind == 'mul':
-                factor = float(layer_args.pop(0))
-                net = Lambda(lambda x : x * factor)
-            elif kind == 'add':
-                amt = float(layer_args.pop(0))
-                net = Lambda(lambda x : x + amt)
-            elif kind == 'scale_pm1_to_01':
-                net = Lambda(lambda x : x / 2 + 0.5)
-            elif kind == 'scale_01_to_pm1':
-                net = Lambda(lambda x : x * 2 - 1)
-            elif kind == 'softmax':
-                net = torch.nn.Softmax(dim=-1)
-            else:
-                raise ValueError("unknown op '{}'".format(kind))
-            layers += [net]
-            if verbose:
-                print(input_shape)
-        assert type(input_shape) is list
-
-        class Model(nn.Module):
-            def __init__(self):
-                super(Model, self).__init__()
-                self.params = nn.ParameterList(params)
-                self._layers_ = nn.ModuleList([item for item in layers])
-                self.layers = layers
-                self.layer_names = [layer[0] for layer in spec]
-
-            def forward(self, x):
-                for i, l in enumerate(layers):
-                    x = l(x)
-                return x
-
-        model = Model()
-        if verbose:
-            print('Num model params', sum((p.numel() for p in model.parameters())))
-        return model, input_shape
