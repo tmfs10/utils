@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torchvision as tv
 import inspect
+from typing import Union
 
 # load_dataset - load dataset from torchvision or data dir or file
 # get_rng_state - get random number generator state for torch and numpy
@@ -13,6 +14,26 @@ import inspect
 # debug_print - print with prefix being filename and line number
 # shape_assert - assert shape of tensor is equal to given list with -1 meaning don't care
 # specify_gpu -- specify which gpu index to use, -1 means use given criterion
+# mask_split -- indices which tell which tensor should each tensor element go to
+
+def mask_split(
+    tensor_list: Union[torch.Tensor, list[torch.Tensor]], 
+    indices : torch.LongTensor
+) -> list[list[torch.Tensor]]:
+    if type(tensor_list) is torch.Tensor:
+        tensor_list = [tensor_list]
+
+    split_tensors = []
+    num_tensors = None
+    for tensor in tensor_list:
+        sorter = torch.argsort(indices)
+        _, counts = torch.unique(indices, return_counts=True)
+        split_tensors += [torch.split(t[sorter], counts.tolist())]
+        if num_tensors is None:
+            num_tensors = len(split_tensors[-1])
+        else:
+            assert num_tensors == len(split_tensors[-1])
+    return split_tensors, num_tensors
 
 def load_dataset(dataset_name, data_dir, train=True):
     transforms = tv.transforms.ToTensor()
@@ -325,7 +346,7 @@ def recursive_split(s, delim=','):
 #   conv:256,4->bn->lrelu->fc:20->lrelu
 #
 #   , for options for layer
-#   | for parallel layers
+#   | for parallel layers. Maps i-1, jth layer to i, jth layer unless it's J layers -> 1 layer in which case it's a merge
 
 #   input:num_inputs
 #   conv1d:num_filters,kernel_size,stride
