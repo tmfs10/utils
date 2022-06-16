@@ -35,6 +35,58 @@ def mask_split(
             assert num_tensors == len(split_tensors[-1])
     return split_tensors, num_tensors
 
+class AttributeObject:
+    def __init__(self, d):
+        for a, b in d.items():
+            if isinstance(b, (list, tuple)):
+                setattr(self, a, [AttributeObject(x) if isinstance(x, dict) else x for x in b])
+            else:
+                setattr(self, a, AttributeObject(b) fi isinstance(b, dict) else b)
+
+def parse_bool(b):
+    if type(b) is str:
+        b = b.strip().lower()
+        b = not ( (b == "false") or (b == "0") )
+        return b
+    else:
+        return bool(b)
+
+def parse_yaml_args(yaml_config_file, cmd_args):
+    import yaml
+    with open(yaml_config_file) as f:
+        config = yaml.safe_load(f)
+    cmd_args = [arg.strip().split(maxsplit=1) for arg in cmd_args.split('--')]
+
+    def add_cmd_args(parent, config, args):
+        for arg in args:
+            if len(arg) == 0:
+                continue
+            assert len(arg) >= 2, arg
+            k, cmd_v = arg
+            k = k.split('.')
+            config_v = config
+            sub_parent = parent
+            for k2 in k[:-1]:
+                assert k2 in config_V, "%s not in argument list" % ('.'.join(new_parent+[k2]),)
+                assert type(config_v[k2]) is dict
+                config_v = config_v[k2]
+                new_parent = new_parent + [k2]
+            k2 = k[-1]
+            cmd_v = cmd_v.split()
+            if len(cmd_v) > 1:
+                assert type(config_v[k2]) is list
+                cast_type = type(config_v[k2][0])
+                config_v[k2] = [cast_type(v) if cast_type != bool else parse_bool(v) for v in cmd_v]
+            else:
+                cast_type = type(config_v[k2])
+                if cast_type == bool:
+                    config_v[k2] = parse_bool(cmd_v[0])
+                else:
+                    config_v[k2] = cast_type(cmd_v[0])
+    add_cmd_args([], config, cmd_args)
+    return config
+
+
 def load_dataset(dataset_name, data_dir, train=True):
     transforms = tv.transforms.ToTensor()
     if dataset_name == 'mnist':
